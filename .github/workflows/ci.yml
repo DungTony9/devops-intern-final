@@ -1,0 +1,113 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/nginx-app
+
+jobs:
+  lint:
+    name: Lint Scripts & Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        run: shellcheck scripts/*.sh
+
+      - name: Run Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: app/Dockerfile
+
+  build:
+    name: Build Docker Image
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build image with BUILD_SHA
+        run: |
+          docker build \
+            --build-arg BUILD_SHA="${{ github.sha }}" \
+            -t nginx-app:"${{ github.sha }}" \
+            ./app
+          docker save nginx-app:"${{ github.sha }}" -o /tmp/nginx-app.tar
+
+      - name: Upload image artifact for testing
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/nginx-app.tar
+          retention-days: 1
+
+  test:
+    name: Test Container Readiness
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download built image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load image and verify health
+        run: |
+          docker load -i /tmp/nginx-app.tar
+          docker run -d --name test-container -p 8080:8080 nginx-app:"${{ github.sha }}"
+          for i in $(seq 1 15); do
+            if curl -s http://localhost:8080/healthz >/dev/null; then
+              break
+            fi
+            echo "Waiting for container readiness... ($i/15)"
+            sleep 1
+          done
+          ./scripts/healthcheck.sh http://localhost:8080/healthz
+          docker rm -f test-container
+
+  publish:
+    name: Publish to GHCR
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image to GHCR
+        run: |
+          IMAGE_URI=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          docker build \
+            --build-arg BUILD_SHA="${{ github.sha }}" \
+            -t "${{ env.REGISTRY }}/${IMAGE_URI}:${{ github.sha }}" \
+            -t "${{ env.REGISTRY }}/${IMAGE_URI}:latest" \
+            ./app
+          docker push "${{ env.REGISTRY }}/${IMAGE_URI}:${{ github.sha }}"
+          docker push "${{ env.REGISTRY }}/${IMAGE_URI}:latest"
